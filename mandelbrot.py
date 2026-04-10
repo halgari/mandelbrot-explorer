@@ -1,10 +1,19 @@
 """GPU-accelerated Mandelbrot Explorer using OpenGL fragment shaders."""
 
+import math
 import struct
 import sys
 
 import moderngl
 import pygame
+
+
+def auto_iterations(scale, base=128, factor=50):
+    """Scale iterations logarithmically with zoom depth."""
+    zoom = 1.5 / scale  # zoom = 1.0 at default view
+    if zoom <= 1.0:
+        return base
+    return int(base + factor * math.log2(zoom))
 
 VERTEX_SHADER_330 = """
 #version 330
@@ -198,10 +207,11 @@ class HudOverlay:
         self.vao.render(moderngl.TRIANGLE_STRIP)
 
 
-def render_hud_surface(font, fps, max_iter, scale, center_x, center_y, use_double, show_help):
+def render_hud_surface(font, fps, max_iter, iter_offset, scale, center_x, center_y, use_double, show_help):
     """Render the HUD text to a pygame surface with transparency."""
+    offset_str = f" ({iter_offset:+d})" if iter_offset != 0 else " (auto)"
     lines = [
-        f"FPS: {fps:.0f}  |  Iterations: {max_iter}  |  Zoom: {1.5/scale:.2e}x",
+        f"FPS: {fps:.0f}  |  Iterations: {max_iter}{offset_str}  |  Zoom: {1.5/scale:.2e}x",
         f"Center: ({center_x:.12f}, {center_y:.12f})",
         f"Precision: {'double (fp64)' if use_double else 'float (fp32)'}",
     ]
@@ -210,7 +220,8 @@ def render_hud_surface(font, fps, max_iter, scale, center_x, center_y, use_doubl
         lines.append("--- Controls ---")
         lines.append("Scroll         Zoom in/out (toward cursor)")
         lines.append("Left drag      Pan")
-        lines.append("+/-            Increase/decrease iterations")
+        lines.append("+/-            Adjust iterations (auto-scales with zoom)")
+        lines.append("G              Go to coordinates (x, y[, zoom])")
         lines.append("R              Reset view")
         lines.append("H              Toggle this help")
         lines.append("Q / Esc        Quit")
@@ -225,6 +236,30 @@ def render_hud_surface(font, fps, max_iter, scale, center_x, center_y, use_doubl
 
     for i, line in enumerate(lines):
         text_surf = font.render(line, True, (255, 255, 255))
+        surf.blit(text_surf, (padding, padding + i * line_height))
+
+    return surf
+
+
+def render_input_surface(font, text, screen_w):
+    """Render the coordinate input box."""
+    padding = 10
+    lines = [
+        "Go to:  x, y[, zoom]",
+        f"> {text}_",
+        "Enter to jump, Esc to cancel",
+    ]
+    line_height = font.get_height() + 2
+    box_w = min(500, screen_w - 20)
+    box_h = line_height * len(lines) + padding * 2
+
+    surf = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+    surf.fill((0, 0, 0, 200))
+    pygame.draw.rect(surf, (100, 180, 255), (0, 0, box_w, box_h), 2)
+
+    for i, line in enumerate(lines):
+        color = (100, 180, 255) if i == 0 else (255, 255, 255)
+        text_surf = font.render(line, True, color)
         surf.blit(text_surf, (padding, padding + i * line_height))
 
     return surf
@@ -267,12 +302,14 @@ def main():
     # Mandelbrot parameters
     center_x, center_y = -0.5, 0.0
     scale = 1.5
-    max_iter = 256
+    iter_offset = 0  # manual +/- adjustment on top of auto
 
     dragging = False
     drag_start = (0, 0)
     drag_center_start = (0.0, 0.0)
     show_help = True
+    input_mode = False
+    input_text = ""
 
     clock = pygame.time.Clock()
     width, height = WIDTH, HEIGHT
@@ -283,19 +320,45 @@ def main():
             if event.type == pygame.QUIT:
                 running = False
 
+            elif event.type == pygame.KEYDOWN and input_mode:
+                if event.key == pygame.K_ESCAPE:
+                    input_mode = False
+                    input_text = ""
+                elif event.key == pygame.K_RETURN:
+                    # Parse: "x, y" or "x, y, zoom"
+                    input_mode = False
+                    try:
+                        parts = [p.strip() for p in input_text.split(",")]
+                        center_x = float(parts[0])
+                        center_y = float(parts[1])
+                        if len(parts) >= 3:
+                            zoom = float(parts[2])
+                            scale = 1.5 / zoom
+                    except (ValueError, IndexError):
+                        pass  # invalid input, just dismiss
+                    input_text = ""
+                elif event.key == pygame.K_BACKSPACE:
+                    input_text = input_text[:-1]
+                else:
+                    if event.unicode and event.unicode in "0123456789.,-+eE ":
+                        input_text += event.unicode
+
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE or event.key == pygame.K_q:
                     running = False
                 elif event.key == pygame.K_r:
                     center_x, center_y = -0.5, 0.0
                     scale = 1.5
-                    max_iter = 256
+                    iter_offset = 0
                 elif event.key == pygame.K_h:
                     show_help = not show_help
+                elif event.key == pygame.K_g:
+                    input_mode = True
+                    input_text = ""
                 elif event.key == pygame.K_PLUS or event.key == pygame.K_EQUALS:
-                    max_iter = min(max_iter + 64, 8192)
+                    iter_offset += 64
                 elif event.key == pygame.K_MINUS:
-                    max_iter = max(max_iter - 64, 64)
+                    iter_offset -= 64
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
@@ -347,6 +410,9 @@ def main():
                 width, height = event.w, event.h
                 ctx.viewport = (0, 0, width, height)
 
+        # Auto-scale iterations with zoom depth
+        max_iter = max(64, auto_iterations(scale) + iter_offset)
+
         # Set uniforms
         if use_double:
             prog["center"].value = (center_x, center_y)
@@ -367,9 +433,14 @@ def main():
         ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
         fps = clock.get_fps()
         hud_surf = render_hud_surface(
-            font, fps, max_iter, scale, center_x, center_y, use_double, show_help
+            font, fps, max_iter, iter_offset, scale, center_x, center_y, use_double, show_help
         )
         hud.render(hud_surf, width, height, 10, 10)
+
+        # Render input overlay if active
+        if input_mode:
+            input_surf = render_input_surface(font, input_text, width)
+            hud.render(input_surf, width, height, 10, height // 2 - 30)
 
         pygame.display.flip()
         clock.tick(0)
